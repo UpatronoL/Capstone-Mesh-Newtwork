@@ -30,6 +30,7 @@ Communication is divided into three main stages:
 ---
 
 ## 🧩 Project Structure
+```
 .
 ├── README.md
 ├── reciver
@@ -40,7 +41,7 @@ Communication is divided into three main stages:
 ├── sensor
 │   └── sensor.ino
 └── UMLdiagram.png
-
+```
 
 ---
 
