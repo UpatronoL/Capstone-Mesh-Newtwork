@@ -1,7 +1,5 @@
 #include <RadioLib.h>
 
-// ======================= RADIO CORE =======================
-
 STM32WLx_Module wl;
 STM32WLx radio(&wl);
 
@@ -11,38 +9,36 @@ static const uint32_t RFSW_PINS[] = {
 };
 
 static const Module::RfSwitchMode_t RFSW_TABLE[] = {
-  { STM32WLx::MODE_IDLE, { LOW, LOW } },
-  { STM32WLx::MODE_RX, { HIGH, LOW } },
-  { STM32WLx::MODE_TX_LP, { LOW, HIGH } },
-  { STM32WLx::MODE_TX_HP, { LOW, HIGH } },
+  { STM32WLx::MODE_IDLE,  { LOW,  LOW  } },
+  { STM32WLx::MODE_RX,    { HIGH, LOW  } },
+  { STM32WLx::MODE_TX_LP, { LOW,  HIGH } },
+  { STM32WLx::MODE_TX_HP, { LOW,  HIGH } },
   END_OF_MODE_TABLE,
 };
 
-// ======================= LORA PARAMS =======================
-
-static const float FREQ_MHZ = 923.2f;
-static const float BW_KHZ = 500.0f;
-static const uint8_t SF = 5;
-static const uint8_t CR = 5;
+static const float FREQ_MHZ   = 923.2f;
+static const float BW_KHZ     = 500.0f;
+static const uint8_t SF       = 5;
+static const uint8_t CR       = 5;
 static const uint8_t SYNCWORD = 0x12;
-static const int8_t PWR_DBM = 14;
+static const int8_t PWR_DBM   = 14;
 static const uint16_t PREAMBLE = 8;
-static const float TCXO_V = 1.6f;
-static const bool USE_LDO = false;
-
-// ======================= NODE ROLES =======================
+static const float TCXO_V     = 1.6f;
+static const bool USE_LDO     = false;
 
 static const int NODE_ID = 1;  // this repeater
 static const int SINK_ID = 0;  // final receiver / Pi
 
-// ======================= TIMING / RETRIES =======================
-
-static const unsigned long BEACON_INTERVAL_MS = 5000UL;
-static const unsigned long REGISTRATION_WINDOW_MS = 5UL * 60UL * 1000UL;
-static const unsigned long FORWARD_ACK_TIMEOUT_MS = 3000UL;
-static const uint8_t MAX_FORWARD_RETRIES = 3;
-
-// ======================= MESSAGE TYPES =======================
+static const unsigned long BEACON_INTERVAL     = 5000UL;
+static const unsigned long BEACON_JITTER       = 2000UL;
+static const unsigned long NEIGHBOR_TIMEOUT    = 30000UL;
+static const int RSSI_THRESHOLD                = -115;
+static const unsigned long RANK_SETTLE_TIME    = 60000UL;
+static const uint8_t MAX_HOPS                  = 5;
+static const unsigned long ROUTE_UPDATE_INTERVAL = 10000UL;
+static const unsigned long DEDUP_TIMEOUT       = 30000UL;
+static const unsigned long ACK_TIMEOUT         = 3000UL;
+static const uint8_t MAX_RETRIES               = 3;
 
 struct MeshMessage {
   bool valid = false;
@@ -74,31 +70,47 @@ struct MeshMessage {
   bool hasData = false;
 };
 
+struct Neighbor {
+  int id = -1;
+  int rank = 255;
+  int rssi = -200;
+  unsigned long lastHeard = 0;
+  bool isValid = false;
+};
+
+struct SeenPacket {
+  int originatorId = -1;
+  int sequenceNumber = -1;
+  unsigned long timestamp = 0;
+  bool valid = false;
+};
+
 struct ForwardState {
   bool active = false;
   int sensorId = -1;
   uint16_t seq = 0;
   int ttl = 0;
   String payload;
-  bool flood = false;
   uint8_t retries = 0;
   unsigned long lastSend = 0;
 };
 
-// ======================= STATE VARS =======================
+static const size_t MAX_NEIGHBORS = 15;
+static const size_t CACHE_SIZE    = 20;
 
-uint16_t beaconSeq = 0;
+Neighbor   neighborTable[MAX_NEIGHBORS];
+SeenPacket seenCache[CACHE_SIZE];
+
+uint16_t beaconSeq  = 0;
 uint16_t controlSeq = 0;
 
-bool sensorRegistered = false;
-int registeredSensorId = -1;
-unsigned long registrationExpiresAt = 0;
-
-unsigned long lastBeaconSent = 0;
+int myRank          = 255;
+int bestNextHop     = -1;
+unsigned long lastRankUpdate = 0;
+unsigned long lastBeacon     = 0;
+bool needsRankUpdate         = false;
 
 ForwardState forwardState;
-
-// ======================= HELPERS: SEQ / BUILD =======================
 
 uint16_t nextBeaconSeq() {
   return ++beaconSeq;
@@ -108,7 +120,7 @@ uint16_t nextControlSeq() {
   return ++controlSeq;
 }
 
-String buildBaseMessage(const char* type, int src, int dst, int seq) {
+String buildMessage(const char* type, int src, int dst, int seq, int rank = -1, int ttl = -1, int orig = -1, int ack = -1, const String& data = "") {
   String msg = "TYPE=";
   msg += type;
   msg += ";SRC=";
@@ -117,38 +129,38 @@ String buildBaseMessage(const char* type, int src, int dst, int seq) {
   msg += dst;
   msg += ";SEQ=";
   msg += seq;
+
+  if (rank >= 0) {
+    msg += ";RANK=";
+    msg += rank;
+  }
+
+  if (ttl >= 0) {
+    msg += ";TTL=";
+    msg += ttl;
+  }
+
+  if (orig >= 0) {
+    msg += ";ORIG=";
+    msg += orig;
+  }
+
+  if (ack >= 0) {
+    msg += ";ACK=";
+    msg += ack;
+  }
+
+  if (data.length() > 0) {
+    msg += ";DATA=";
+    msg += data;
+  }
+
   return msg;
 }
 
 String buildBeaconMessage() {
-  String msg = buildBaseMessage("BEACON", NODE_ID, -1, nextBeaconSeq());
-  msg += ";RANK=0";
-  return msg;
+  return buildMessage("BEACON", NODE_ID, -1, nextBeaconSeq(), myRank);
 }
-
-String buildRegistrationPing(int sensorId) {
-  return buildBaseMessage("REG_PING", NODE_ID, sensorId, nextControlSeq());
-}
-
-String buildAckForSensor(uint16_t seq, int sensorId) {
-  String msg = buildBaseMessage("ACK", NODE_ID, sensorId, nextControlSeq());
-  msg += ";ACK=";
-  msg += seq;
-  return msg;
-}
-
-String buildForwardPacket(uint16_t seq, int ttl, int sensorId, const String& payload) {
-  String msg = buildBaseMessage("DATA", NODE_ID, SINK_ID, seq);
-  msg += ";TTL=";
-  msg += ttl;
-  msg += ";ORIG=";
-  msg += sensorId;
-  msg += ";DATA=";
-  msg += payload;
-  return msg;
-}
-
-// ======================= PARSER =======================
 
 MeshMessage parseMessage(const String& raw) {
   MeshMessage msg;
@@ -171,41 +183,34 @@ MeshMessage parseMessage(const String& raw) {
     int end = header.indexOf(';', start);
     if (end < 0) end = header.length();
 
-    String token = header.substring(start, end);
-    token.trim();
+    int eq = header.indexOf('=', start);
+    if (eq > start && eq < end) {
+      String key = header.substring(start, eq);
+      String val = header.substring(eq + 1, end);
 
-    if (token.length() > 0) {
-      int eq = token.indexOf('=');
-      if (eq >= 0) {
-        String key = token.substring(0, eq);
-        String val = token.substring(eq + 1);
-        key.trim();
-        val.trim();
-
-        if (key == "TYPE") {
-          msg.type = val;
-        } else if (key == "SRC") {
-          msg.src = val.toInt();
-          msg.hasSrc = true;
-        } else if (key == "DST") {
-          msg.dst = val.toInt();
-          msg.hasDst = true;
-        } else if (key == "SEQ") {
-          msg.seq = val.toInt();
-          msg.hasSeq = true;
-        } else if (key == "TTL") {
-          msg.ttl = val.toInt();
-          msg.hasTtl = true;
-        } else if (key == "RANK") {
-          msg.rank = val.toInt();
-          msg.hasRank = true;
-        } else if (key == "ACK") {
-          msg.ack = val.toInt();
-          msg.hasAck = true;
-        } else if (key == "ORIG") {
-          msg.orig = val.toInt();
-          msg.hasOrig = true;
-        }
+      if (key == "TYPE") {
+        msg.type = val;
+      } else if (key == "SRC") {
+        msg.src = val.toInt();
+        msg.hasSrc = true;
+      } else if (key == "DST") {
+        msg.dst = val.toInt();
+        msg.hasDst = true;
+      } else if (key == "SEQ") {
+        msg.seq = val.toInt();
+        msg.hasSeq = true;
+      } else if (key == "TTL") {
+        msg.ttl = val.toInt();
+        msg.hasTtl = true;
+      } else if (key == "RANK") {
+        msg.rank = val.toInt();
+        msg.hasRank = true;
+      } else if (key == "ACK") {
+        msg.ack = val.toInt();
+        msg.hasAck = true;
+      } else if (key == "ORIG") {
+        msg.orig = val.toInt();
+        msg.hasOrig = true;
       }
     }
 
@@ -219,9 +224,8 @@ MeshMessage parseMessage(const String& raw) {
   return msg;
 }
 
-// ======================= RADIO SEND =======================
-
 void sendMessage(const String& payload) {
+  delay(random(10, 50));
   int16_t state = radio.transmit(payload);
   if (state == RADIOLIB_ERR_NONE) {
     Serial.print(F("[TX] "));
@@ -235,35 +239,207 @@ void sendMessage(const String& payload) {
 void sendBeacon() {
   String msg = buildBeaconMessage();
   sendMessage(msg);
-  lastBeaconSent = millis();
+  lastBeacon = millis();
+  Serial.print(F("[BEACON] rank="));
+  Serial.println(myRank);
 }
 
-// ======================= HANDLERS: JOIN =======================
-
-void handleAnnounce(const MeshMessage& msg) {
-  registeredSensorId = msg.src;
-  sensorRegistered = true;
-  registrationExpiresAt = millis() + REGISTRATION_WINDOW_MS;
-
-  Serial.print(F("[JOIN] Sensor announced: "));
-  Serial.println(registeredSensorId);
-
-  sendMessage(buildRegistrationPing(registeredSensorId));
+Neighbor* findNeighbor(int nodeId) {
+  for (size_t i = 0; i < MAX_NEIGHBORS; i++) {
+    if (neighborTable[i].isValid && neighborTable[i].id == nodeId) {
+      return &neighborTable[i];
+    }
+  }
+  return nullptr;
 }
 
-void handleJoinConfirm(const MeshMessage& msg) {
-  if (!sensorRegistered || msg.src != registeredSensorId) {
+Neighbor* findEmptySlot() {
+  for (size_t i = 0; i < MAX_NEIGHBORS; i++) {
+    if (!neighborTable[i].isValid) {
+      return &neighborTable[i];
+    }
+  }
+  return nullptr;
+}
+
+void clearNeighborTable() {
+  for (size_t i = 0; i < MAX_NEIGHBORS; i++) {
+    neighborTable[i].isValid = false;
+  }
+}
+
+void updateNeighbor(int nodeId, int rank, int rssi, unsigned long now) {
+  Neighbor* slot = findNeighbor(nodeId);
+
+  if (slot == nullptr) {
+    slot = findEmptySlot();
+  }
+
+  if (slot == nullptr) {
+    Serial.print(F("[NB] Table full, ignoring "));
+    Serial.println(nodeId);
     return;
   }
 
-  registrationExpiresAt = millis() + REGISTRATION_WINDOW_MS;
-  Serial.println(F("[JOIN] Sensor confirmed JOIN"));
+  slot->id = nodeId;
+  slot->rank = rank;
+  slot->rssi = rssi;
+  slot->lastHeard = now;
+  slot->isValid = true;
+
+  Serial.print(F("[NB] Updated neighbor "));
+  Serial.print(nodeId);
+  Serial.print(F(" rank="));
+  Serial.print(rank);
+  Serial.print(F(" rssi="));
+  Serial.println(rssi);
 }
 
-// ======================= FORWARDING =======================
+void pruneStaleNeighbors(unsigned long now) {
+  for (size_t i = 0; i < MAX_NEIGHBORS; i++) {
+    if (neighborTable[i].isValid) {
+      if ((now - neighborTable[i].lastHeard) > NEIGHBOR_TIMEOUT) {
+        Serial.print(F("[NB] Neighbor timeout: "));
+        Serial.println(neighborTable[i].id);
+        if (neighborTable[i].id == bestNextHop) {
+          bestNextHop = -1;
+          needsRankUpdate = true;
+        }
+        neighborTable[i].isValid = false;
+      }
+    }
+  }
+}
+
+int findBestNextHop() {
+  Neighbor* bestNeighbor = nullptr;
+  int bestRssi = -999;
+
+  for (size_t i = 0; i < MAX_NEIGHBORS; i++) {
+    Neighbor& nb = neighborTable[i];
+    if (!nb.isValid) continue;
+    if (nb.rank >= myRank) continue;
+    if (nb.rssi < RSSI_THRESHOLD) continue;
+
+    if (nb.rssi > bestRssi) {
+      bestRssi = nb.rssi;
+      bestNeighbor = &nb;
+    }
+  }
+
+  if (bestNeighbor != nullptr) {
+    return bestNeighbor->id;
+  }
+  return -1;
+}
+
+void updateMyRank() {
+  int oldRank = myRank;
+  int minNeighborRank = 255;
+
+  for (size_t i = 0; i < MAX_NEIGHBORS; i++) {
+    Neighbor& nb = neighborTable[i];
+    if (nb.isValid && nb.rssi >= RSSI_THRESHOLD && nb.rank < minNeighborRank) {
+      minNeighborRank = nb.rank;
+    }
+  }
+
+  if (minNeighborRank < 255) {
+    myRank = minNeighborRank + 1;
+    if (myRank > MAX_HOPS) {
+      myRank = 255;
+    }
+  } else {
+    myRank = 255;
+  }
+
+  if (myRank != oldRank) {
+    Serial.print(F("[RANK] Changed: "));
+    Serial.print(oldRank);
+    Serial.print(F(" -> "));
+    Serial.println(myRank);
+    lastRankUpdate = millis();
+  }
+}
+
+void updateRoutingState(unsigned long now) {
+  if (now < RANK_SETTLE_TIME && myRank == 255 && !needsRankUpdate) {
+    return;
+  }
+
+  if ((now - lastRankUpdate) > ROUTE_UPDATE_INTERVAL || needsRankUpdate) {
+    updateMyRank();
+    bestNextHop = findBestNextHop();
+
+    if (bestNextHop != -1) {
+      Serial.print(F("[ROUTE] Best next hop: "));
+      Serial.println(bestNextHop);
+    } else {
+      Serial.println(F("[ROUTE] WARNING: No route to sink"));
+    }
+
+    needsRankUpdate = false;
+    lastRankUpdate = now;
+  }
+}
+
+SeenPacket* findOldestCacheSlot() {
+  size_t oldestIdx = 0;
+  unsigned long oldestTime = UINT32_MAX;
+
+  for (size_t i = 0; i < CACHE_SIZE; i++) {
+    if (!seenCache[i].valid) {
+      return &seenCache[i];
+    }
+    if (seenCache[i].timestamp < oldestTime) {
+      oldestTime = seenCache[i].timestamp;
+      oldestIdx = i;
+    }
+  }
+
+  return &seenCache[oldestIdx];
+}
+
+bool hasSeenPacket(int origId, int seqNum) {
+  unsigned long now = millis();
+
+  for (size_t i = 0; i < CACHE_SIZE; i++) {
+    if (seenCache[i].valid && (now - seenCache[i].timestamp) > DEDUP_TIMEOUT) {
+      seenCache[i].valid = false;
+    }
+
+    if (seenCache[i].valid &&
+        seenCache[i].originatorId == origId &&
+        seenCache[i].sequenceNumber == seqNum) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void addToSeenCache(int origId, int seqNum) {
+  SeenPacket* slot = findOldestCacheSlot();
+  slot->originatorId = origId;
+  slot->sequenceNumber = seqNum;
+  slot->timestamp = millis();
+  slot->valid = true;
+}
+
+void clearSeenCache() {
+  for (size_t i = 0; i < CACHE_SIZE; i++) {
+    seenCache[i].valid = false;
+  }
+}
 
 void forwardToSink() {
   if (!forwardState.active) return;
+
+  if (bestNextHop == -1) {
+    Serial.println(F("[FWD] No route to sink, cannot forward"));
+    forwardState.active = false;
+    return;
+  }
 
   if (forwardState.ttl < 0) {
     Serial.println(F("[FWD] TTL expired, dropping"));
@@ -271,35 +447,50 @@ void forwardToSink() {
     return;
   }
 
-  String packet = buildForwardPacket(
+  String packet = buildMessage(
+    "DATA",
+    NODE_ID,
+    bestNextHop,
     forwardState.seq,
+    -1,
     forwardState.ttl,
     forwardState.sensorId,
-    forwardState.payload);
+    -1,
+    forwardState.payload
+  );
 
   sendMessage(packet);
   forwardState.lastSend = millis();
   forwardState.retries++;
+
+  Serial.print(F("[FWD] Forwarded to "));
+  Serial.print(bestNextHop);
+  Serial.print(F(" ttl="));
+  Serial.println(forwardState.ttl);
 }
 
 void acknowledgeSensor() {
   if (!forwardState.active) return;
 
-  String ack = buildAckForSensor(forwardState.seq, forwardState.sensorId);
+  String ack = buildMessage(
+    "ACK",
+    NODE_ID,
+    forwardState.sensorId,
+    nextControlSeq(),
+    -1,
+    -1,
+    -1,
+    forwardState.seq
+  );
   sendMessage(ack);
 
   forwardState.active = false;
+  Serial.println(F("[ACK] Forwarding complete, ACKed sensor"));
 }
 
-// DATA / FLOOD from sensor → repeater
 void handleDataFromSensor(const MeshMessage& msg) {
   if (!msg.hasSeq || !msg.hasTtl || !msg.hasData) {
     Serial.println(F("[RX] Malformed DATA from sensor"));
-    return;
-  }
-
-  if (sensorRegistered && msg.src != registeredSensorId) {
-    Serial.println(F("[RX] Ignoring data from unregistered sensor"));
     return;
   }
 
@@ -308,92 +499,99 @@ void handleDataFromSensor(const MeshMessage& msg) {
     return;
   }
 
-  // If we're already forwarding something:
+  if (hasSeenPacket(msg.src, msg.seq)) {
+    Serial.println(F("[RX] Duplicate packet, ignoring"));
+    return;
+  }
+
   if (forwardState.active) {
     // Retransmission of the same packet → retry forward
     if (msg.seq == forwardState.seq && msg.src == forwardState.sensorId) {
-      Serial.println(F("[FWD] Retransmission detected, retrying forward"));
+      Serial.println(F("[FWD] Retransmission detected, will retry"));
       forwardState.ttl = msg.ttl - 1;
       forwardState.payload = msg.data;
-      forwardState.flood = (msg.type == "FLOOD");
       forwardState.retries = 0;
       forwardToSink();
     } else {
-      Serial.println(F("[FWD] Busy, ignoring new uplink"));
+      Serial.println(F("[FWD] Busy forwarding, rejecting new packet"));
     }
     return;
   }
 
-  // New uplink to forward
-  forwardState.active = true;
-  forwardState.sensorId = msg.src;
-  forwardState.seq = msg.seq;
-  forwardState.ttl = msg.ttl - 1;
-  forwardState.payload = msg.data;
-  forwardState.flood = (msg.type == "FLOOD");
-  forwardState.retries = 0;
+  Serial.print(F("[FWD] Received DATA from sensor "));
+  Serial.print(msg.src);
+  Serial.print(F(" seq="));
+  Serial.println(msg.seq);
 
-  Serial.print(F("[FWD] Forwarding seq "));
-  Serial.print(forwardState.seq);
-  Serial.print(F(" flood="));
-  Serial.println(forwardState.flood ? F("yes") : F("no"));
+  addToSeenCache(msg.src, msg.seq);
+
+  forwardState.active   = true;
+  forwardState.sensorId = msg.src;
+  forwardState.seq      = msg.seq;
+  forwardState.ttl      = msg.ttl - 1;
+  forwardState.payload  = msg.data;
+  forwardState.retries  = 0;
 
   forwardToSink();
 }
 
-// ACK from sink → repeater
-void handleAckFromSink(const MeshMessage& msg) {
-  if (!msg.hasAck || !forwardState.active) return;
+void handleAck(const MeshMessage& msg) {
+  if (!forwardState.active || !msg.hasAck) return;
   if (msg.ack != forwardState.seq) return;
 
-  Serial.print(F("[ACK] Sink confirmed seq "));
+  Serial.print(F("[ACK] Received for seq "));
   Serial.println(msg.ack);
 
   acknowledgeSensor();
 }
 
-// ======================= RX DISPATCH =======================
+void handleBeacon(const MeshMessage& msg, int rssi, unsigned long now) {
+  if (!msg.hasRank) return;
 
-void processIncoming(const MeshMessage& msg) {
+  updateNeighbor(msg.src, msg.rank, rssi, now);
+
+  if (msg.rank < myRank - 1) {
+    needsRankUpdate = true;
+  }
+
+  Serial.print(F("[BEACON][RX] from "));
+  Serial.print(msg.src);
+  Serial.print(F(" rank="));
+  Serial.print(msg.rank);
+  Serial.print(F(" rssi="));
+  Serial.println(rssi);
+}
+
+void processIncoming(const MeshMessage& msg, int rssi, unsigned long now) {
   if (!msg.valid) return;
 
-  // ANNOUNCE from sensor to this repeater
-  if (msg.type == "ANNOUNCE" && msg.dst == NODE_ID) {
-    handleAnnounce(msg);
-
-    // JOIN_CONFIRM from sensor
-  } else if (msg.type == "JOIN_CONFIRM" && msg.dst == NODE_ID) {
-    handleJoinConfirm(msg);
-
-    // DATA / FLOOD from sensor
-  } else if ((msg.type == "DATA" || msg.type == "FLOOD") && msg.dst == NODE_ID) {
+  if (msg.type == "BEACON") {
+    handleBeacon(msg, rssi, now);
+  } else if (msg.type == "DATA" && msg.dst == NODE_ID) {
     handleDataFromSensor(msg);
-
-    // ACK from sink to repeater
-  } else if (msg.type == "ACK" && msg.dst == NODE_ID && msg.src == SINK_ID) {
-    handleAckFromSink(msg);
+  } else if (msg.type == "ACK" && msg.dst == NODE_ID) {
+    handleAck(msg);
   }
 }
 
 void pollRadio() {
-  // Poll a few times per loop to reduce latency
   for (int i = 0; i < 4; i++) {
     String incoming;
-    int16_t st = radio.receive(incoming);
+    int16_t rssi = 0;
+    int16_t st = radio.receive(incoming, rssi);
 
     if (st == RADIOLIB_ERR_NONE) {
       Serial.print(F("[RX] "));
-      Serial.println(incoming);
+      Serial.print(incoming);
+      Serial.print(F(" rssi="));
+      Serial.println(rssi);
 
       MeshMessage msg = parseMessage(incoming);
-      processIncoming(msg);
+      processIncoming(msg, rssi, millis());
 
     } else if (st == RADIOLIB_ERR_RX_TIMEOUT || st == RADIOLIB_ERR_CRC_MISMATCH) {
-      // No valid frame / bad CRC: end burst
       break;
-
     } else {
-      // Other RX error
       Serial.print(F("[RX][ERR] "));
       Serial.println(st);
       break;
@@ -401,14 +599,14 @@ void pollRadio() {
   }
 }
 
-// ======================= SETUP / LOOP =======================
-
 void setup() {
   Serial.begin(115200);
   while (!Serial) { ; }
 
+  randomSeed(analogRead(0));
+
   Serial.println();
-  Serial.println(F("=== Mesh Repeater (Rank 0) ==="));
+  Serial.println(F("=== Mesh Repeater (Dynamic Rank) ==="));
 
   radio.setRfSwitchTable(RFSW_PINS, RFSW_TABLE);
   Serial.println(F("[INIT] RF switch table applied"));
@@ -422,7 +620,8 @@ void setup() {
     PWR_DBM,
     PREAMBLE,
     TCXO_V,
-    USE_LDO);
+    USE_LDO
+  );
 
   Serial.print(F("[INIT] radio.begin -> "));
   Serial.println(stateInit);
@@ -435,36 +634,39 @@ void setup() {
   }
 
   radio.setCRC(true);
-  Serial.println(F("[INIT] Repeater ready, sending BEACONs"));
+  clearNeighborTable();
+  clearSeenCache();
+
+  myRank        = 255;
+  bestNextHop   = -1;
+  lastRankUpdate = millis();
+  lastBeacon     = millis();
+
+  Serial.println(F("[INIT] Repeater ready, discovering network..."));
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // Periodic BEACON (advertise repeater presence)
-  if (now - lastBeaconSent >= BEACON_INTERVAL_MS) {
+  unsigned long nextBeaconDelay = BEACON_INTERVAL + random(0, BEACON_JITTER);
+  if ((now - lastBeacon) >= nextBeaconDelay) {
     sendBeacon();
   }
 
-  // Handle incoming packets
   pollRadio();
 
-  // Registration timeout
-  if (sensorRegistered && now > registrationExpiresAt) {
-    Serial.println(F("[JOIN] Registration expired"));
-    sensorRegistered = false;
-    registeredSensorId = -1;
-  }
+  pruneStaleNeighbors(now);
+  updateRoutingState(now);
 
-  // Forward retry logic (waiting for sink ACK)
-  if (forwardState.active && (now - forwardState.lastSend) > FORWARD_ACK_TIMEOUT_MS) {
-
-    if (forwardState.retries < MAX_FORWARD_RETRIES) {
-      Serial.println(F("[FWD] No ACK from sink, retrying"));
-      forwardToSink();
-    } else {
-      Serial.println(F("[FWD] Exhausted retries, dropping packet"));
-      forwardState.active = false;
+  if (forwardState.active) {
+    if ((now - forwardState.lastSend) > ACK_TIMEOUT) {
+      if (forwardState.retries < MAX_RETRIES) {
+        Serial.println(F("[FWD] No ACK yet, retrying"));
+        forwardToSink();
+      } else {
+        Serial.println(F("[FWD] Retries exhausted, dropping packet"));
+        forwardState.active = false;
+      }
     }
   }
 
