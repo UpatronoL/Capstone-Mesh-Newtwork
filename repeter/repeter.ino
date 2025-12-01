@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <RadioLib.h>
 
 STM32WLx_Module wl;
@@ -21,7 +22,7 @@ static const float BW_KHZ     = 500.0f;
 static const uint8_t SF       = 5;
 static const uint8_t CR       = 5;
 static const uint8_t SYNCWORD = 0x12;
-static const int8_t PWR_DBM   = 14;
+static const int8_t PWR_DBM   = -5;
 static const uint16_t PREAMBLE = 8;
 static const float TCXO_V     = 1.6f;
 static const bool USE_LDO     = false;
@@ -29,16 +30,16 @@ static const bool USE_LDO     = false;
 static const int NODE_ID = 1;  // this repeater
 static const int SINK_ID = 0;  // final receiver / Pi
 
-static const unsigned long BEACON_INTERVAL     = 5000UL;
-static const unsigned long BEACON_JITTER       = 2000UL;
-static const unsigned long NEIGHBOR_TIMEOUT    = 30000UL;
-static const int RSSI_THRESHOLD                = -115;
-static const unsigned long RANK_SETTLE_TIME    = 60000UL;
-static const uint8_t MAX_HOPS                  = 5;
+static const unsigned long BEACON_INTERVAL       = 5000UL;
+static const unsigned long BEACON_JITTER         = 2000UL;
+static const unsigned long NEIGHBOR_TIMEOUT      = 30000UL;
+static const int           RSSI_THRESHOLD        = -115;
+static const unsigned long RANK_SETTLE_TIME      = 60000UL;
+static const uint8_t       MAX_HOPS              = 5;
 static const unsigned long ROUTE_UPDATE_INTERVAL = 10000UL;
-static const unsigned long DEDUP_TIMEOUT       = 30000UL;
-static const unsigned long ACK_TIMEOUT         = 3000UL;
-static const uint8_t MAX_RETRIES               = 3;
+static const unsigned long DEDUP_TIMEOUT         = 30000UL;
+static const unsigned long ACK_TIMEOUT           = 3000UL;
+static const uint8_t       MAX_RETRIES           = 3;
 
 struct MeshMessage {
   bool valid = false;
@@ -120,7 +121,9 @@ uint16_t nextControlSeq() {
   return ++controlSeq;
 }
 
-String buildMessage(const char* type, int src, int dst, int seq, int rank = -1, int ttl = -1, int orig = -1, int ack = -1, const String& data = "") {
+String buildMessage(const char* type, int src, int dst, int seq,
+                    int rank = -1, int ttl = -1, int orig = -1,
+                    int ack = -1, const String& data = "") {
   String msg = "TYPE=";
   msg += type;
   msg += ";SRC=";
@@ -224,7 +227,7 @@ MeshMessage parseMessage(const String& raw) {
   return msg;
 }
 
-void sendMessage(const String& payload) {
+void sendMessage(String& payload) {
   delay(random(10, 50));
   int16_t state = radio.transmit(payload);
   if (state == RADIOLIB_ERR_NONE) {
@@ -363,10 +366,7 @@ void updateMyRank() {
 }
 
 void updateRoutingState(unsigned long now) {
-  if (now < RANK_SETTLE_TIME && myRank == 255 && !needsRankUpdate) {
-    return;
-  }
-
+  // Only recompute if enough time has passed OR we were explicitly asked to
   if ((now - lastRankUpdate) > ROUTE_UPDATE_INTERVAL || needsRankUpdate) {
     updateMyRank();
     bestNextHop = findBestNextHop();
@@ -409,7 +409,7 @@ bool hasSeenPacket(int origId, int seqNum) {
     }
 
     if (seenCache[i].valid &&
-        seenCache[i].originatorId == origId &&
+        seenCache[i].originatorId   == origId &&
         seenCache[i].sequenceNumber == seqNum) {
       return true;
     }
@@ -420,10 +420,10 @@ bool hasSeenPacket(int origId, int seqNum) {
 
 void addToSeenCache(int origId, int seqNum) {
   SeenPacket* slot = findOldestCacheSlot();
-  slot->originatorId = origId;
+  slot->originatorId   = origId;
   slot->sequenceNumber = seqNum;
-  slot->timestamp = millis();
-  slot->valid = true;
+  slot->timestamp      = millis();
+  slot->valid          = true;
 }
 
 void clearSeenCache() {
@@ -508,7 +508,7 @@ void handleDataFromSensor(const MeshMessage& msg) {
     // Retransmission of the same packet → retry forward
     if (msg.seq == forwardState.seq && msg.src == forwardState.sensorId) {
       Serial.println(F("[FWD] Retransmission detected, will retry"));
-      forwardState.ttl = msg.ttl - 1;
+      forwardState.ttl     = msg.ttl - 1;
       forwardState.payload = msg.data;
       forwardState.retries = 0;
       forwardToSink();
@@ -550,9 +550,18 @@ void handleBeacon(const MeshMessage& msg, int rssi, unsigned long now) {
 
   updateNeighbor(msg.src, msg.rank, rssi, now);
 
-  if (msg.rank < myRank - 1) {
-    needsRankUpdate = true;
+  // If we hear the sink directly (ID 0, rank 0), we know our rank = 1
+  if (msg.src == SINK_ID && msg.rank == 0) {
+    int oldRank = myRank;
+    myRank = 1;
+    bestNextHop = SINK_ID;
+    Serial.print(F("[RANK] Direct link to sink, "));
+    Serial.print(oldRank);
+    Serial.print(F(" -> "));
+    Serial.println(myRank);
   }
+
+  needsRankUpdate = true;
 
   Serial.print(F("[BEACON][RX] from "));
   Serial.print(msg.src);
@@ -577,10 +586,12 @@ void processIncoming(const MeshMessage& msg, int rssi, unsigned long now) {
 void pollRadio() {
   for (int i = 0; i < 4; i++) {
     String incoming;
-    int16_t rssi = 0;
-    int16_t st = radio.receive(incoming, rssi);
+    int16_t st = radio.receive(incoming);  // no rssi param here
 
     if (st == RADIOLIB_ERR_NONE) {
+      float rssiF = radio.getRSSI();       // ask RadioLib after RX
+      int16_t rssi = (int16_t)rssiF;
+
       Serial.print(F("[RX] "));
       Serial.print(incoming);
       Serial.print(F(" rssi="));
@@ -637,8 +648,8 @@ void setup() {
   clearNeighborTable();
   clearSeenCache();
 
-  myRank        = 255;
-  bestNextHop   = -1;
+  myRank         = 255;
+  bestNextHop    = -1;
   lastRankUpdate = millis();
   lastBeacon     = millis();
 
@@ -653,7 +664,11 @@ void loop() {
     sendBeacon();
   }
 
+  // RX can update neighbor timestamps using a *newer* millis()
   pollRadio();
+
+  // Refresh 'now' AFTER RX so it's >= any lastHeard we just wrote
+  now = millis();
 
   pruneStaleNeighbors(now);
   updateRoutingState(now);

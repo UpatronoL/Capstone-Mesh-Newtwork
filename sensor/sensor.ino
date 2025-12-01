@@ -5,38 +5,44 @@
 #include <BH1750.h>
 #include <OneWire.h>
 
+// ======================= PINS =======================
+
 #define I2C_SDA_PIN PB7
 #define I2C_SCL_PIN PB6
 #define ONE_WIRE_BUS PB0
 #define SOIL_MOISTURE_PIN PA1
 
-static const float FREQ_MHZ = 923.2f;  // JP band example
-static const float BW_KHZ = 500.0f;
-static const uint8_t SF = 5;
-static const uint8_t CR = 5;  // 4/5
-static const uint8_t SYNCWORD = 0x12;
-static const int8_t PWR_DBM = 22;
-static const uint16_t PREAMBLE = 8;
-static const float TCXO_V = 1.6f;
-static const bool USE_LDO = false;
+// ======================= RADIO CONFIG =======================
 
-// Mesh / Node Config
-static const int DEVICE_ID = 5;  // rank-1 sensor node
-static const uint8_t MAX_TTL = 3;
+static const float   FREQ_MHZ   = 923.2f;  // JP band example
+static const float   BW_KHZ     = 500.0f;
+static const uint8_t SF         = 5;
+static const uint8_t CR         = 5;       // 4/5
+static const uint8_t SYNCWORD   = 0x12;
+static const int8_t  PWR_DBM    = -6;
+static const uint16_t PREAMBLE  = 8;
+static const float   TCXO_V     = 1.6f;
+static const bool    USE_LDO    = false;
 
-static const unsigned long DISCOVERY_SCAN_INTERVAL = 5000UL;      // 5s log
-static const unsigned long BEACON_COLLECTION_TIME = 30000UL;      // 30s window
-static const unsigned long BEACON_TIMEOUT = 60000UL;              // 60s stale
-static const unsigned long REG_PING_TIMEOUT = 3000UL;             // 3s wait
-static const unsigned long ACK_TIMEOUT = 3000UL;                  // 3s wait
-static const unsigned long UPLINK_INTERVAL = 30000UL;             // 30s data
+// ======================= MESH / NODE CONFIG =======================
 
-static const uint8_t MAX_DATA_RETRIES = 3;
-static const uint8_t MAX_FLOOD_RETRIES = 2;
+static const int      DEVICE_ID               = 5;    // sensor node ID
+static const uint8_t  MAX_TTL                 = 3;
 
-static const int RSSI_THRESHOLD = -115;          // dBm
-static const int RANK_PREFERENCE_WEIGHT = 10;    // dB per hop
-static const uint8_t MAX_NEIGHBORS = 10;         // neighbor table size
+static const unsigned long DISCOVERY_SCAN_INTERVAL = 5000UL;   // 5s log
+static const unsigned long BEACON_COLLECTION_TIME  = 30000UL;  // 30s window
+static const unsigned long BEACON_TIMEOUT          = 60000UL;  // 60s stale
+static const unsigned long ACK_TIMEOUT             = 3000UL;   // 3s wait
+static const unsigned long UPLINK_INTERVAL         = 30000UL;  // 30s data
+
+static const uint8_t  MAX_DATA_RETRIES   = 3;
+static const uint8_t  MAX_FLOOD_RETRIES  = 2;
+
+static const int      RSSI_THRESHOLD        = -115;   // dBm
+static const int      RANK_PREFERENCE_WEIGHT = 10;    // dB per hop
+static const uint8_t  MAX_NEIGHBORS        = 10;      // neighbor table size
+
+// ======================= RADIO CORE =======================
 
 STM32WLx_Module wl;
 STM32WLx radio(&wl);
@@ -54,14 +60,17 @@ static const Module::RfSwitchMode_t RFSW_TABLE[] = {
   END_OF_MODE_TABLE,
 };
 
+// ======================= SENSORS =======================
+
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 AHT20 aht20;
 BH1750 lightMeter;
 
+// ======================= STATE =======================
+
 enum SensorState {
   DISCOVERING,
-  WAIT_REG_PING,
   JOINED
 };
 
@@ -113,29 +122,24 @@ struct UplinkState {
 };
 
 SensorState currentState = DISCOVERING;
-Neighbor neighborTable[MAX_NEIGHBORS];
+Neighbor    neighborTable[MAX_NEIGHBORS];
 
-int bestRepeaterId = -1;
-uint8_t bestRepeaterRank = 255;
+int         bestRepeaterId   = -1;   // actually "best parent" (can be sink or repeater)
+uint8_t     bestRepeaterRank = 255;
 
-unsigned long bootTime = 0;
-unsigned long lastBeaconHeard = 0;
-unsigned long lastDiscoveryLog = 0;
-unsigned long lastAnnounceTime = 0;
-unsigned long lastUplinkTime = 0;
+unsigned long bootTime          = 0;
+unsigned long lastDiscoveryLog  = 0;
+unsigned long lastUplinkTime    = 0;
 
-uint16_t uplinkSequence = 0;
-uint16_t controlSequence = 0;
+uint16_t     uplinkSequence  = 0;
+uint16_t     controlSequence = 0;
 
-UplinkState uplinkState;
+UplinkState  uplinkState;
 
-uint16_t nextUplinkSeq() {
-  return ++uplinkSequence;
-}
+// ======================= SMALL HELPERS =======================
 
-uint16_t nextControlSeq() {
-  return ++controlSequence;
-}
+uint16_t nextUplinkSeq()   { return ++uplinkSequence; }
+uint16_t nextControlSeq()  { return ++controlSequence; }
 
 void clearNeighborTable() {
   for (uint8_t i = 0; i < MAX_NEIGHBORS; i++) {
@@ -172,16 +176,17 @@ void updateNeighbor(int nodeId, uint8_t rank, int rssi, unsigned long now) {
     return;
   }
 
-  slot->id = nodeId;
-  slot->rank = rank;
-  slot->rssi = rssi;
+  slot->id        = nodeId;
+  slot->rank      = rank;
+  slot->rssi      = rssi;
   slot->lastHeard = now;
-  slot->isValid = true;
+  slot->isValid   = true;
 }
 
 void pruneStaleNeighbors(unsigned long now) {
   for (uint8_t i = 0; i < MAX_NEIGHBORS; i++) {
-    if (neighborTable[i].isValid && (now - neighborTable[i].lastHeard) > BEACON_TIMEOUT) {
+    if (neighborTable[i].isValid &&
+        (now - neighborTable[i].lastHeard) > BEACON_TIMEOUT) {
       Serial.print(F("[NEIGHBOR] Timeout -> "));
       Serial.println(neighborTable[i].id);
       neighborTable[i].isValid = false;
@@ -208,6 +213,8 @@ uint8_t countValidNeighbors() {
   return cnt;
 }
 
+// ======================= SENSOR PAYLOAD =======================
+
 String getSensorReadings() {
   // DS18B20 soil temp
   sensors.requestTemperatures();
@@ -220,14 +227,14 @@ String getSensorReadings() {
   }
 
   // AHT20 air temp / humidity
-  float airTemp = aht20.getTemperature();
+  float airTemp  = aht20.getTemperature();
   float humidity = aht20.getHumidity();
 
   // BH1750 lux
   float lux = lightMeter.readLightLevel();
 
   // Soil moisture (raw -> %)
-  int rawMoisture = analogRead(SOIL_MOISTURE_PIN);
+  int rawMoisture     = analogRead(SOIL_MOISTURE_PIN);
   int moisturePercent = map(rawMoisture, 0, 4095, 0, 100);
 
   char msg[128];
@@ -246,7 +253,16 @@ String getSensorReadings() {
   return String(msg);
 }
 
-String buildMessage(const char* type, int src, int dst, int seq, int rank = -999, int ttl  = -999, int ack  = -999, const String& data = "") {
+// ======================= MESSAGE FORMAT =======================
+
+String buildMessage(const char* type,
+                    int src,
+                    int dst,
+                    int seq,
+                    int rank = -999,
+                    int ttl  = -999,
+                    int ack  = -999,
+                    const String& data = "") {
 
   String msg = "TYPE=";
   msg += type;
@@ -346,6 +362,8 @@ MeshMessage parseMessage(const String& raw) {
   return msg;
 }
 
+// ======================= RADIO SEND =======================
+
 void sendMessage(const String& payload) {
   int16_t state = radio.transmit(payload);
   if (state == RADIOLIB_ERR_NONE) {
@@ -357,46 +375,15 @@ void sendMessage(const String& payload) {
   }
 }
 
-void announceToRepeater() {
-  if (bestRepeaterId < 0) return;
-
-  String message = buildMessage(
-    "ANNOUNCE",
-    DEVICE_ID,
-    bestRepeaterId,
-    nextControlSeq(),
-    bestRepeaterRank + 1
-  );
-
-  sendMessage(message);
-  lastAnnounceTime = millis();
-
-  Serial.print(F("[JOIN] Announce -> repeater "));
-  Serial.println(bestRepeaterId);
-}
-
-void sendJoinConfirm() {
-  String confirm = buildMessage(
-    "JOIN_CONFIRM",
-    DEVICE_ID,
-    bestRepeaterId,
-    nextControlSeq()
-  );
-  sendMessage(confirm);
-
-  currentState = JOINED;
-  uplinkState.active = false;
-  lastUplinkTime = millis();
-
-  Serial.print(F("[JOIN] Joined via repeater "));
-  Serial.println(bestRepeaterId);
-}
+// ======================= REPEATER SELECTION =======================
 
 bool hasCollectedEnoughBeacons(unsigned long now) {
+  // Wait at least BEACON_COLLECTION_TIME after boot
   if ((now - bootTime) < BEACON_COLLECTION_TIME) {
     return false;
   }
 
+  // Prefer at least one rank-1 neighbor with good RSSI
   for (uint8_t i = 0; i < MAX_NEIGHBORS; i++) {
     if (neighborTable[i].isValid && neighborTable[i].rank == 1) {
       if (neighborTable[i].rssi > RSSI_THRESHOLD + 10) {
@@ -405,6 +392,7 @@ bool hasCollectedEnoughBeacons(unsigned long now) {
     }
   }
 
+  // Or at least 2 valid neighbors total
   if (countValidNeighbors() >= 2) {
     return true;
   }
@@ -418,10 +406,11 @@ int selectBestRepeater() {
 
   for (uint8_t i = 0; i < MAX_NEIGHBORS; i++) {
     Neighbor& n = neighborTable[i];
-    if (!n.isValid) continue;
+    if (!n.isValid)   continue;
     if (n.rank >= 255) continue;
     if (n.rssi < RSSI_THRESHOLD) continue;
 
+    // Higher RSSI and lower rank is better
     int score = n.rssi - (n.rank * RANK_PREFERENCE_WEIGHT);
     if (score > bestScore) {
       bestScore = score;
@@ -446,63 +435,36 @@ bool isRepeaterStillAlive(int repeaterId, unsigned long now) {
 }
 
 void attemptRepeaterFailover(unsigned long now) {
-  Serial.println(F("[FAILOVER] Attempting backup repeater"));
+  Serial.println(F("[FAILOVER] Attempting backup parent"));
   pruneStaleNeighbors(now);
 
   int newRepeater = selectBestRepeater();
   if (newRepeater != -1 && newRepeater != bestRepeaterId) {
     bestRepeaterId = newRepeater;
-    Serial.print(F("[FAILOVER] Switching to repeater "));
+    Serial.print(F("[FAILOVER] Switching to parent "));
     Serial.println(bestRepeaterId);
 
-    announceToRepeater();
-    currentState = WAIT_REG_PING;
-    uplinkState.active = false;
+    uplinkState.active    = false;
+    uplinkState.floodMode = false;
+    lastUplinkTime        = now;
+    currentState          = JOINED;
   } else {
     Serial.println(F("[FAILOVER] No backup found, restarting discovery"));
-    bestRepeaterId = -1;
-    currentState = DISCOVERING;
-    uplinkState.active = false;
+    bestRepeaterId      = -1;
+    currentState        = DISCOVERING;
+    uplinkState.active  = false;
+    uplinkState.floodMode = false;
     clearNeighborTable();
   }
 }
 
-void handleDiscoveryState(unsigned long now) {
-  pruneStaleNeighbors(now);
-
-  if (now - lastDiscoveryLog > DISCOVERY_SCAN_INTERVAL) {
-    Serial.print(F("[DISCOVERY] Scanning... neighbors="));
-    Serial.println(countValidNeighbors());
-    lastDiscoveryLog = now;
-  }
-
-  if (hasCollectedEnoughBeacons(now)) {
-    bestRepeaterId = selectBestRepeater();
-    if (bestRepeaterId != -1) {
-      Serial.print(F("[DISCOVERY] Selected repeater "));
-      Serial.println(bestRepeaterId);
-      announceToRepeater();
-      currentState = WAIT_REG_PING;
-    } else {
-      Serial.println(F("[DISCOVERY] No suitable repeater yet"));
-    }
-  }
-}
-
-void handleWaitRegPingState(unsigned long now) {
-  if ((now - lastAnnounceTime) > REG_PING_TIMEOUT) {
-    Serial.println(F("[JOIN] REG_PING timeout, restarting discovery"));
-    markNeighborUnreliable(bestRepeaterId);
-    bestRepeaterId = -1;
-    currentState = DISCOVERING;
-  }
-}
+// ======================= UPLINK LOGIC =======================
 
 void startNewUplink() {
-  uplinkState.active = true;
-  uplinkState.seq = nextUplinkSeq();
-  uplinkState.payload = getSensorReadings();
-  uplinkState.retries = 0;
+  uplinkState.active    = true;
+  uplinkState.seq       = nextUplinkSeq();
+  uplinkState.payload   = getSensorReadings();
+  uplinkState.retries   = 0;
   uplinkState.floodMode = false;
 
   Serial.print(F("[UPLINK] Start seq="));
@@ -511,11 +473,12 @@ void startNewUplink() {
 
 void transmitUplink() {
   if (!uplinkState.active) return;
+  if (bestRepeaterId < 0)  return;
 
   String msg = buildMessage(
     uplinkState.floodMode ? "FLOOD" : "DATA",
     DEVICE_ID,
-    bestRepeaterId,
+    bestRepeaterId,                   // parent (can be sink or repeater)
     uplinkState.seq,
     -999,
     uplinkState.floodMode ? MAX_TTL : 1,
@@ -545,7 +508,7 @@ void handleUplinkTimeout(unsigned long now) {
     } else {
       Serial.println(F("[UPLINK] Escalate to FLOOD"));
       uplinkState.floodMode = true;
-      uplinkState.retries = 0;
+      uplinkState.retries   = 0;
       transmitUplink();
     }
   } else {
@@ -554,9 +517,10 @@ void handleUplinkTimeout(unsigned long now) {
       transmitUplink();
     } else {
       Serial.println(F("[UPLINK] FLOOD exhausted, restart discovery"));
-      uplinkState.active = false;
-      currentState = DISCOVERING;
-      bestRepeaterId = -1;
+      uplinkState.active    = false;
+      uplinkState.floodMode = false;
+      currentState          = DISCOVERING;
+      bestRepeaterId        = -1;
       clearNeighborTable();
     }
   }
@@ -564,18 +528,49 @@ void handleUplinkTimeout(unsigned long now) {
 
 void handleAck(const MeshMessage& msg) {
   if (!uplinkState.active || !msg.hasAck) return;
-  if (msg.ack != uplinkState.seq) return;
-  if (msg.src != bestRepeaterId) return;
+  if (msg.ack != uplinkState.seq)        return;
+  if (msg.src != bestRepeaterId)         return;   // Only trust current parent
 
   Serial.print(F("[ACK] Received for seq="));
   Serial.println(uplinkState.seq);
 
-  uplinkState.active = false;
+  uplinkState.active    = false;
   uplinkState.floodMode = false;
   Serial.println(F("[UPLINK] Success"));
 }
 
+// ======================= STATE HANDLERS =======================
+
+void handleDiscoveryState(unsigned long now) {
+  pruneStaleNeighbors(now);
+
+  if (now - lastDiscoveryLog > DISCOVERY_SCAN_INTERVAL) {
+    Serial.print(F("[DISCOVERY] Scanning... neighbors="));
+    Serial.println(countValidNeighbors());
+    lastDiscoveryLog = now;
+  }
+
+  if (hasCollectedEnoughBeacons(now)) {
+    bestRepeaterId = selectBestRepeater();
+    if (bestRepeaterId != -1) {
+      Serial.print(F("[DISCOVERY] Selected parent "));
+      Serial.print(bestRepeaterId);
+      Serial.print(F(" (rank="));
+      Serial.print(bestRepeaterRank);
+      Serial.println(')');
+
+      currentState          = JOINED;
+      uplinkState.active    = false;
+      uplinkState.floodMode = false;
+      lastUplinkTime        = now;
+    } else {
+      Serial.println(F("[DISCOVERY] No suitable parent yet"));
+    }
+  }
+}
+
 void handleJoinedState(unsigned long now) {
+  // Periodic uplink
   if (!uplinkState.active) {
     if ((now - lastUplinkTime) >= UPLINK_INTERVAL) {
       startNewUplink();
@@ -584,17 +579,22 @@ void handleJoinedState(unsigned long now) {
     }
   }
 
-  if (uplinkState.active && (now - uplinkState.lastSend) > ACK_TIMEOUT) {
+  // Timeout / retry logic for active uplink
+  if (uplinkState.active &&
+      (now - uplinkState.lastSend) > ACK_TIMEOUT) {
     handleUplinkTimeout(now);
   }
 
   pruneStaleNeighbors(now);
 
+  // Check if current parent disappeared
   if (!isRepeaterStillAlive(bestRepeaterId, now)) {
-    Serial.println(F("[KEEPALIVE] Repeater lost"));
+    Serial.println(F("[KEEPALIVE] Parent lost"));
     attemptRepeaterFailover(now);
   }
 }
+
+// ======================= PACKET HANDLERS =======================
 
 void handleBeacon(const MeshMessage& msg, int rssi, unsigned long now) {
   if (!msg.hasRank || msg.rank >= 255) return;
@@ -606,35 +606,16 @@ void handleBeacon(const MeshMessage& msg, int rssi, unsigned long now) {
   Serial.print(msg.rank);
   Serial.print(F(" rssi="));
   Serial.println(rssi);
-
-  if (currentState == JOINED && msg.src == bestRepeaterId) {
-    lastBeaconHeard = now;
-    Serial.println(F("[KEEPALIVE] Beacon from repeater"));
-  }
-}
-
-void handleRegPing(const MeshMessage& msg) {
-  if (currentState != WAIT_REG_PING) return;
-  if (msg.src != bestRepeaterId) {
-    Serial.print(F("[JOIN] Unexpected REG_PING from "));
-    Serial.println(msg.src);
-    return;
-  }
-
-  Serial.print(F("[JOIN] REG_PING from repeater "));
-  Serial.println(bestRepeaterId);
-  sendJoinConfirm();
 }
 
 void processIncoming(const MeshMessage& msg, int rssi, unsigned long now) {
   if (!msg.valid) return;
 
+  // Only handle packets addressed to me or broadcast
   if (msg.dst != DEVICE_ID && msg.dst != -1) return;
 
   if (msg.type == "BEACON") {
     handleBeacon(msg, rssi, now);
-  } else if (msg.type == "REG_PING") {
-    handleRegPing(msg);
   } else if (msg.type == "ACK") {
     handleAck(msg);
   }
@@ -648,12 +629,15 @@ void pollRadio() {
     if (rxState == RADIOLIB_ERR_NONE) {
       int rssi = (int)radio.getRSSI();
       MeshMessage msg = parseMessage(incoming);
+
       if (msg.valid) {
         Serial.print(F("[RX] "));
         Serial.println(incoming);
       }
+
       processIncoming(msg, rssi, millis());
-    } else if (rxState == RADIOLIB_ERR_RX_TIMEOUT || rxState == RADIOLIB_ERR_CRC_MISMATCH) {
+    } else if (rxState == RADIOLIB_ERR_RX_TIMEOUT ||
+               rxState == RADIOLIB_ERR_CRC_MISMATCH) {
       break;
     } else {
       Serial.print(F("[RX][ERR] "));
@@ -662,6 +646,8 @@ void pollRadio() {
     }
   }
 }
+
+// ======================= SETUP / LOOP =======================
 
 void setup() {
   Serial.begin(115200);
@@ -672,6 +658,7 @@ void setup() {
 
   bootTime = millis();
 
+  // I2C + sensors
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
   Wire.begin();
@@ -687,6 +674,7 @@ void setup() {
     Serial.println(F("[INIT][WARN] BH1750 init failed"));
   }
 
+  // Radio
   radio.setRfSwitchTable(RFSW_PINS, RFSW_TABLE);
   Serial.println(F("[INIT] RF switch table applied"));
 
@@ -716,6 +704,8 @@ void setup() {
   clearNeighborTable();
   uplinkState = UplinkState();
 
+  currentState = DISCOVERING;
+
   Serial.println(F("[INIT] Discovery started"));
 }
 
@@ -727,10 +717,6 @@ void loop() {
   switch (currentState) {
     case DISCOVERING:
       handleDiscoveryState(now);
-      break;
-
-    case WAIT_REG_PING:
-      handleWaitRegPingState(now);
       break;
 
     case JOINED:
